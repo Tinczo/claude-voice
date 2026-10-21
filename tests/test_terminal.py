@@ -1,6 +1,7 @@
 """Hooks run without a controlling terminal; find Claude Code's instead."""
 
 import os
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -31,6 +32,7 @@ class AncestorTtyTests(unittest.TestCase):
         ):
             self.assertIsNone(cv._ancestor_tty())
 
+    @unittest.skipIf(sys.platform == "win32", "no os.ttyname; Windows uses one console key")
     def test_resolve_tty_falls_back_to_ancestor(self):
         with (
             mock.patch.object(cv.os, "ttyname", side_effect=OSError),

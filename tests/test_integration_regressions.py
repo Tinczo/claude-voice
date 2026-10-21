@@ -125,6 +125,7 @@ def test_session_updates_preserve_concurrent_writers(monkeypatch):
         assert len(sessions) == 9
         assert sessions["shared"]["voice"] == "af_heart"
         assert sessions["shared"]["enabled"] is False
-        assert os.stat(cv.SESSIONS_PATH).st_mode & 0o777 == 0o600
+        if os.name == "posix":  # Windows privacy is an ACL; see test_windows_compat
+            assert os.stat(cv.SESSIONS_PATH).st_mode & 0o777 == 0o600
         cv._update_session("shared", "clear")
         assert "shared" not in cv._load_sessions()

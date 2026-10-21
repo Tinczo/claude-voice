@@ -77,6 +77,28 @@ Cloud-only (no local model, tiny install): drop `[local]` and pick a provider:
 
 Restart Claude Code and every response will be spoken. Try `/voice status` inside Claude Code.
 
+### Windows
+
+Native Windows 10/11 works without WSL. Use a standard Python 3.11+ (python.org or Microsoft Store, not an MSYS2/MinGW build, which can't install `torch`):
+
+```powershell
+git clone https://github.com/Null-Phnix/claude-voice
+cd claude-voice
+py -3.12 -m venv .venv
+.venv\Scripts\pip install torch --index-url https://download.pytorch.org/whl/cpu   # optional: skips the CUDA download
+.venv\Scripts\pip install -e ".[local]"
+.venv\Scripts\claude-voice setup
+```
+
+Differences from macOS and Linux:
+
+- The daemon listens on `127.0.0.1` (Windows Python has no Unix sockets). Each run creates a random port and secret token in `~/.cache/claude-voice/daemon.addr`; requests without the token are rejected.
+- Runtime and config folders get an access-control list for your account instead of `chmod 600`. Administrators can still read them, just as root can on Unix.
+- Every console shares one routing key, so `/voice mute` silences all of them. Use `/voice session off` or `/voice project off` to silence a single session or project.
+- Hooks play audio only; karaoke renders only for `--no-daemon` runs in a console.
+- The `system` provider uses the built-in Windows voices (`claude-voice voices system`). Add more, including other languages, in Settings → Time & language → Speech.
+- `claude-voice clip` reads the clipboard through PowerShell.
+
 ---
 
 ## Providers
@@ -238,7 +260,7 @@ claude-voice --no-daemon "text" # bypass the daemon; speak in-process
 
 ## Daemon mode
 
-Loading Kokoro takes ~6–10s, and the Stop hook fires a fresh Python process for every response. The daemon loads the model once and accepts requests over a Unix socket (`~/.cache/claude-voice/daemon.sock`), so warm TTFA drops to ~0.6s. It exits after 30 minutes idle and respawns on the next speak. Cloud providers go through it too — the hook client returns in ~50ms instead of blocking.
+Loading Kokoro takes ~6–10s, and the Stop hook fires a fresh Python process for every response. The daemon loads the model once and accepts requests over a Unix socket (`~/.cache/claude-voice/daemon.sock`), so warm TTFA drops to ~0.6s. On Windows it uses token-authenticated localhost TCP instead (see [Windows](#windows)). It exits after 30 minutes idle and respawns on the next speak. Cloud providers go through it too — the hook client returns in ~50ms instead of blocking.
 
 `claude-voice daemon-status`, `claude-voice daemon-stop`, or set `"use_daemon": false` in config to opt out.
 
@@ -292,7 +314,7 @@ Prefer Hammerspoon? [`integrations/hammerspoon-snippet.lua`](integrations/hammer
 2. **Code-heavy responses get skipped** — If a response is >50% inside code fences, the hook skips it. Correct, but the heuristic is crude and sometimes skips useful explanations that include code examples.
 3. **Estimated karaoke timing on most providers** — Only ElevenLabs returns real word timestamps. Kokoro/OpenAI/Grok timing is length-weighted estimation; good, not perfect.
 4. **Grok output format is undocumented** — xAI's TTS docs don't specify the audio container, so we sniff it (WAV natively, anything else via ffmpeg). Works, but it's a guess until they document it.
-5. **Terminal compatibility** — Works on Kitty, Ghostty, Alacritty, iTerm2. Windows Terminal? Probably not.
+5. **Terminal compatibility** — Works on Kitty, Ghostty, Alacritty, iTerm2. On Windows, ANSI mode is switched on at startup, but karaoke in Windows Terminal is less tested.
 
 ---
 
@@ -318,7 +340,7 @@ Prefer Hammerspoon? [`integrations/hammerspoon-snippet.lua`](integrations/hammer
 - Python 3.11+ (3.12 recommended for Kokoro/torch)
 - `sounddevice`, `numpy` — plus `kokoro` for the local voice
 - `ffmpeg` for cloud providers that return MP3
-- macOS or Linux, any terminal with ANSI true color (Kitty, Ghostty, Alacritty, iTerm2, ...)
+- macOS, Linux or Windows 10/11, any terminal with ANSI true color (Kitty, Ghostty, Alacritty, iTerm2, ...)
 
 ---
 

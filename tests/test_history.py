@@ -45,15 +45,17 @@ class HistoryTests(unittest.TestCase):
         finally:
             os.umask(old_umask)
 
-        file_mode = stat.S_IMODE(self.history_path.stat().st_mode)
-        dir_mode = stat.S_IMODE(self.runtime_dir.stat().st_mode)
-        self.assertEqual(file_mode, 0o600)
-        self.assertEqual(dir_mode, 0o700)
+        if os.name == "posix":  # Windows privacy is an ACL; see test_windows_compat
+            file_mode = stat.S_IMODE(self.history_path.stat().st_mode)
+            dir_mode = stat.S_IMODE(self.runtime_dir.stat().st_mode)
+            self.assertEqual(file_mode, 0o600)
+            self.assertEqual(dir_mode, 0o700)
         self.assertEqual(
             [entry["text"] for entry in cv._read_history()],
             ["message 4", "message 3", "message 2"],
         )
 
+    @unittest.skipUnless(os.name == "posix", "Unix permission bits")
     def test_existing_prototype_history_permissions_are_repaired(self):
         self.runtime_dir.mkdir(mode=0o755)
         self.history_path.write_text('{"text":"old entry"}\n', encoding="utf-8")

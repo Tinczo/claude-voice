@@ -9,7 +9,6 @@ Run with:
 """
 from __future__ import annotations
 
-import json
 import os
 import socket
 import subprocess
@@ -19,35 +18,22 @@ import time
 import unittest
 from pathlib import Path
 
+import daemon_transport
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "claude_voice.py"
 
 
 def _send(sock_path: str, payload: dict, timeout: float = 2.0) -> dict | None:
     """Send one JSON request to the daemon and return the parsed response."""
-    try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect(sock_path)
-        s.sendall(json.dumps(payload).encode() + b"\n")
-        buf = b""
-        while b"\n" not in buf and len(buf) < 8192:
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            buf += chunk
-        s.close()
-        line = buf.split(b"\n", 1)[0]
-        return json.loads(line.decode("utf-8", errors="replace"))
-    except (OSError, socket.timeout, json.JSONDecodeError):
-        return None
+    return daemon_transport.send(sock_path, payload, timeout)
 
 
 def _wait_for_socket(sock_path: str, timeout: float = 10.0) -> bool:
     """Poll until the socket exists and accepts a ping, or timeout."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if os.path.exists(sock_path):
+        if daemon_transport.ready(sock_path):
             resp = _send(sock_path, {"op": "ping"}, timeout=0.5)
             if resp and resp.get("ok"):
                 return True
@@ -93,6 +79,7 @@ class DaemonProtocolTests(unittest.TestCase):
             "    wait=lambda: None, stop=lambda: None)\n"
             f"claude_voice.RUNTIME_DIR = {cls._tmp!r}\n"
             f"claude_voice.SOCK_PATH = {cls.sock_path!r}\n"
+            f"claude_voice.ADDR_PATH = {daemon_transport.addr_path(cls.sock_path)!r}\n"
             f"claude_voice.PID_PATH = {os.path.join(cls._tmp, 'daemon.pid')!r}\n"
             f"claude_voice.LOG_PATH = {cls.log_path!r}\n"
             "claude_voice.cmd_daemon()\n"
@@ -163,9 +150,7 @@ class DaemonProtocolTests(unittest.TestCase):
     def test_malformed_json_does_not_crash_daemon(self):
         # Send garbage; daemon should respond with an error or just close,
         # and a subsequent ping must still succeed.
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(2.0)
-        s.connect(self.sock_path)
+        s, _token = daemon_transport.connect(self.sock_path, 2.0)
         s.sendall(b"not json at all\n")
         try:
             s.recv(256)

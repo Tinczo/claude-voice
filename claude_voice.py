@@ -41,12 +41,13 @@ Commands:
 """
 import argparse
 import base64
-import fcntl
+import hmac
 import io
 import json
 import math
 import os
 import re
+import secrets
 import select
 import shutil
 import signal
@@ -54,14 +55,24 @@ import socket
 import subprocess
 import sys
 import tempfile
-import termios
 import threading
 import time
-import tty
 import urllib.error
 import urllib.request
 import warnings
 import wave
+
+try:
+    import fcntl
+    import termios
+    import tty
+except ImportError:  # Windows
+    fcntl = termios = tty = None
+
+try:
+    import msvcrt
+except ImportError:  # macOS, Linux
+    msvcrt = None
 
 warnings.filterwarnings("ignore")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -79,6 +90,11 @@ except (ImportError, OSError):
 
 VERSION = "0.3.0"
 
+WINDOWS = sys.platform == "win32"
+# Windows has no /dev/tty and no per-terminal device path, so every console
+# shares this routing key. Session and project rules still apply per session.
+WINDOWS_TTY = "console"
+
 # ── defaults ──
 SAMPLE_RATE = 24000
 WINDOW = 8
@@ -94,6 +110,10 @@ SCRIPT_PATH = os.path.abspath(__file__)
 # ── daemon / runtime state ──
 RUNTIME_DIR = os.path.expanduser("~/.cache/claude-voice")
 SOCK_PATH = os.path.join(RUNTIME_DIR, "daemon.sock")
+# Without AF_UNIX (Windows Python) the daemon listens on localhost TCP and
+# publishes its port and a per-run secret token here, readable only by you.
+ADDR_PATH = os.path.join(RUNTIME_DIR, "daemon.addr")
+DAEMON_TCP = not hasattr(socket, "AF_UNIX")
 PID_PATH = os.path.join(RUNTIME_DIR, "daemon.pid")
 LOG_PATH = os.path.join(RUNTIME_DIR, "daemon.log")
 HISTORY_PATH = os.path.join(RUNTIME_DIR, "history.jsonl")
@@ -273,6 +293,7 @@ _old_term = None
 # Daemon-only: serialize playback and track idle time for the idle-timeout exit.
 _playback_lock = threading.Lock()
 _daemon_idle_t0: float = 0.0
+_daemon_token: str = ""               # TCP transport only; checked on every request
 
 # Multi-terminal routing: which tty currently owns the voice, when it claimed,
 # and a per-tty deny-list for the explicit-mute toggle.
@@ -297,6 +318,101 @@ def _require_audio():
             "numpy/sounddevice not installed in this Python. "
             "Run: pip install sounddevice numpy   (and `pip install kokoro` for the local voice)"
         )
+
+
+# ── platform helpers ──
+
+# msvcrt locks are mandatory, so lock a byte far past any real content
+# instead of byte 0, which other handles may still need to read.
+_WIN_LOCK_OFFSET = 1 << 30
+
+
+def _lock_file(f, blocking: bool = True) -> None:
+    """Exclusive lock on an open file. Non-blocking raises OSError if held."""
+    if fcntl is not None:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        return
+    fd = f.fileno()
+    pos = os.lseek(fd, 0, os.SEEK_CUR)
+    os.lseek(fd, _WIN_LOCK_OFFSET, os.SEEK_SET)
+    try:
+        while True:
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                if not blocking:
+                    raise
+                time.sleep(0.05)
+    finally:
+        os.lseek(fd, pos, os.SEEK_SET)
+
+
+def _unlock_file(f) -> None:
+    """Release _lock_file. Closing the file also releases it on POSIX."""
+    if fcntl is not None:
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        return
+    fd = f.fileno()
+    pos = os.lseek(fd, 0, os.SEEK_CUR)
+    os.lseek(fd, _WIN_LOCK_OFFSET, os.SEEK_SET)
+    try:
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+    finally:
+        os.lseek(fd, pos, os.SEEK_SET)
+
+
+def _prepare_windows_console() -> None:
+    """UTF-8 stdio and ANSI colors for the Windows console.
+
+    Pipes otherwise use the ANSI code page (cp1250 on Polish Windows), which
+    garbles hook JSON from Claude Code and fails on characters like "✓".
+    """
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        for handle_id in (-11, -12):  # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+            handle = kernel32.GetStdHandle(handle_id)
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+    except (AttributeError, OSError):
+        pass
+
+
+def _powershell() -> str | None:
+    return shutil.which("powershell") or shutil.which("pwsh")
+
+
+_restricted_dirs: set[str] = set()
+
+
+def _restrict_to_user(path: str) -> None:
+    """Windows counterpart of chmod 0700 on a directory, which is a no-op
+    there: an ACL granting only the current user, inherited by its files."""
+    if not WINDOWS or path in _restricted_dirs:
+        return
+    _restricted_dirs.add(path)
+    user = os.environ.get("USERNAME")
+    if not user:
+        return
+    if os.environ.get("USERDOMAIN"):
+        user = f"{os.environ['USERDOMAIN']}\\{user}"
+    try:
+        # Drop inherited entries (other accounts with profile access), then
+        # grant only this user full control, inherited by files and folders.
+        subprocess.run(["icacls", path, "/inheritance:r", "/grant:r", f"{user}:(OI)(CI)F"],
+                       capture_output=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
 
 
 # ── config ──
@@ -369,7 +485,7 @@ def load_config() -> dict:
     cfg = default_config()
     if os.path.exists(CONFIG_PATH):
         try:
-            with open(CONFIG_PATH) as f:
+            with open(CONFIG_PATH, encoding="utf-8") as f:
                 user = json.load(f)
             for k, v in user.items():
                 if isinstance(v, dict) and isinstance(cfg.get(k), dict):
@@ -397,8 +513,9 @@ def reload_config() -> dict:
 def save_config(cfg: dict):
     global _config
     os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    _restrict_to_user(os.path.dirname(CONFIG_PATH))
     cfg = {k: v for k, v in cfg.items() if k != "voice"}
-    with open(CONFIG_PATH, "w") as f:
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
     try:
         os.chmod(CONFIG_PATH, 0o600)  # config may hold API keys
@@ -464,6 +581,8 @@ def get_tty(tty_path: str = "/dev/tty"):
     user's terminal, not the daemon's (detached) one.
     """
     global _tty
+    if WINDOWS:
+        tty_path = "CONOUT$"  # this process's console; there is no /dev/tty
     try:
         _tty = open(tty_path, "w")
     except OSError:
@@ -493,6 +612,17 @@ def _start_keypress_listener(tty_path: str = "/dev/tty"):
     """
     global _tty_fd, _old_term
 
+    def _listen_windows():
+        global _interrupted
+        while not _interrupted:
+            if msvcrt.kbhit():
+                msvcrt.getwch()
+                _interrupted = True
+                if sd is not None:
+                    sd.stop()
+                break
+            time.sleep(0.05)
+
     def _listen():
         global _interrupted, _tty_fd, _old_term
         fd = None
@@ -519,7 +649,7 @@ def _start_keypress_listener(tty_path: str = "/dev/tty"):
                 except OSError:
                     pass
 
-    t = threading.Thread(target=_listen, daemon=True)
+    t = threading.Thread(target=_listen_windows if WINDOWS else _listen, daemon=True)
     t.start()
     return t
 
@@ -934,7 +1064,7 @@ def ffmpeg_decode(data: bytes, rate: int = SAMPLE_RATE):
     if not shutil.which("ffmpeg"):
         raise ProviderError(
             "this provider returned compressed audio and ffmpeg is not installed. "
-            "Install it (macOS: brew install ffmpeg) and retry."
+            "Install it (macOS: brew install ffmpeg, Windows: winget install ffmpeg) and retry."
         )
     p = subprocess.run(
         ["ffmpeg", "-v", "error", "-i", "pipe:0",
@@ -1023,13 +1153,43 @@ def synth_kokoro(text: str, voice: str, speed: float, cfg: dict):
     return np.concatenate(parts), SAMPLE_RATE, timings
 
 
+# Windows SAPI via PowerShell. The text arrives on stdin as UTF-8 and the
+# options in environment variables, so nothing spoken becomes script code.
+_SAPI_SCRIPT = (
+    "$ErrorActionPreference = 'Stop';"
+    "[Console]::InputEncoding = [Text.Encoding]::UTF8;"
+    "Add-Type -AssemblyName System.Speech;"
+    "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+    "if ($env:CV_VOICE) { $s.SelectVoice($env:CV_VOICE) };"
+    "$s.Rate = [int]$env:CV_RATE;"
+    "$s.SetOutputToWaveFile($env:CV_OUT);"
+    "$s.Speak([Console]::In.ReadToEnd());"
+    "$s.Dispose()"
+)
+
+
+def _synth_sapi(speech: str, voice: str, speed: float, path: str) -> None:
+    ps = _powershell()
+    if not ps:
+        raise ProviderError("no system TTS found (PowerShell is missing)")
+    env = dict(os.environ, CV_VOICE=voice or "", CV_OUT=path,
+               CV_RATE=str(max(-10, min(10, round((speed - 1.0) * 10)))))
+    p = subprocess.run([ps, "-NoProfile", "-NonInteractive", "-Command", _SAPI_SCRIPT],
+                       input=speech.encode("utf-8"), env=env, capture_output=True)
+    if p.returncode != 0:
+        raise ProviderError(f"system TTS failed: {p.stderr.decode(errors='replace')[:200]}")
+
+
 def synth_system(text: str, voice: str, speed: float, cfg: dict):
     speech = fix_pronunciation(text, cfg.get("pronunciations"))
     rate_wpm = str(int(175 * speed))
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         path = f.name
     try:
-        if sys.platform == "darwin":
+        if WINDOWS:
+            _synth_sapi(speech, voice, speed, path)
+            cmd = None
+        elif sys.platform == "darwin":
             cmd = ["say", "-o", path, "--data-format=LEI16@22050", "-r", rate_wpm]
             if voice:
                 cmd += ["-v", voice]
@@ -1042,9 +1202,10 @@ def synth_system(text: str, voice: str, speed: float, cfg: dict):
             if voice:
                 cmd += ["-v", voice]
             cmd.append(speech)
-        p = subprocess.run(cmd, capture_output=True)
-        if p.returncode != 0:
-            raise ProviderError(f"system TTS failed: {p.stderr.decode(errors='replace')[:200]}")
+        if cmd is not None:
+            p = subprocess.run(cmd, capture_output=True)
+            if p.returncode != 0:
+                raise ProviderError(f"system TTS failed: {p.stderr.decode(errors='replace')[:200]}")
         with open(path, "rb") as f:
             data = f.read()
     finally:
@@ -1082,7 +1243,7 @@ def _eleven_resolve_voice(name: str, key: str) -> str:
     cache = {}
     if os.path.exists(ELEVEN_CACHE_PATH):
         try:
-            with open(ELEVEN_CACHE_PATH) as f:
+            with open(ELEVEN_CACHE_PATH, encoding="utf-8") as f:
                 cache = json.load(f)
         except (json.JSONDecodeError, OSError):
             pass
@@ -1092,7 +1253,7 @@ def _eleven_resolve_voice(name: str, key: str) -> str:
         voices = json.loads(raw).get("voices", [])
         cache = {v["name"].lower(): v["voice_id"] for v in voices if v.get("voice_id")}
         os.makedirs(os.path.dirname(ELEVEN_CACHE_PATH), exist_ok=True)
-        with open(ELEVEN_CACHE_PATH, "w") as f:
+        with open(ELEVEN_CACHE_PATH, "w", encoding="utf-8") as f:
             json.dump(cache, f, indent=2)
     if low in cache:
         return cache[low]
@@ -1293,21 +1454,27 @@ def _log_history(text: str, provider: str, voice: str) -> None:
     try:
         os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
         os.chmod(RUNTIME_DIR, 0o700)
-        fd = os.open(HISTORY_PATH, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+        _restrict_to_user(RUNTIME_DIR)
+        flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0)
+        fd = os.open(HISTORY_PATH, flags, 0o600)
         with os.fdopen(fd, "r+", encoding="utf-8") as f:
-            os.fchmod(f.fileno(), 0o600)
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            f.seek(0, os.SEEK_END)
-            f.write(json.dumps({"ts": time.time(), "text": text,
-                                "provider": provider, "voice": voice}) + "\n")
-            f.flush()
-            f.seek(0)
-            lines = f.readlines()
-            if len(lines) > HISTORY_MAX_ENTRIES:
-                f.seek(0)
-                f.truncate()
-                f.writelines(lines[-HISTORY_MAX_ENTRIES:])
+            if hasattr(os, "fchmod"):
+                os.fchmod(f.fileno(), 0o600)
+            _lock_file(f)
+            try:
+                f.seek(0, os.SEEK_END)
+                f.write(json.dumps({"ts": time.time(), "text": text,
+                                    "provider": provider, "voice": voice}) + "\n")
                 f.flush()
+                f.seek(0)
+                lines = f.readlines()
+                if len(lines) > HISTORY_MAX_ENTRIES:
+                    f.seek(0)
+                    f.truncate()
+                    f.writelines(lines[-HISTORY_MAX_ENTRIES:])
+                    f.flush()
+            finally:
+                _unlock_file(f)
     except OSError as e:
         _daemon_log(f"history write failed: {e}")
 
@@ -1316,7 +1483,7 @@ def _read_history() -> list[dict]:
     """Return spoken-message history, newest first."""
     entries = []
     try:
-        with open(HISTORY_PATH) as f:
+        with open(HISTORY_PATH, encoding="utf-8") as f:
             for line in f:
                 try:
                     entry = json.loads(line)
@@ -1511,7 +1678,7 @@ def extract_hook_text(raw: str) -> str:
     path = data.get("transcript_path")
     if path and os.path.exists(path):
         try:
-            with open(path) as f:
+            with open(path, encoding="utf-8") as f:
                 lines = f.readlines()
             for line in reversed(lines):
                 try:
@@ -1540,7 +1707,7 @@ def _turn_was_voice_command(data: dict) -> bool:
     if not path or not os.path.exists(path):
         return False
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             lines = f.readlines()[-200:]
     except OSError:
         return False
@@ -1573,7 +1740,7 @@ def _turn_was_voice_command(data: dict) -> bool:
 def _daemon_log(msg: str) -> None:
     try:
         os.makedirs(RUNTIME_DIR, exist_ok=True)
-        with open(LOG_PATH, "a") as f:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
     except OSError:
         pass
@@ -1587,6 +1754,8 @@ def _resolve_tty() -> str:
     refers to the *calling* process's controlling terminal) and ttyname
     that fd — that gives a stable identifier like `/dev/ttys001`.
     """
+    if WINDOWS:
+        return WINDOWS_TTY
     for fd in (2, 1, 0):
         try:
             return os.ttyname(fd)
@@ -1641,7 +1810,7 @@ def _ancestor_tty() -> str | None:
 
 def _load_sessions() -> dict:
     try:
-        with open(SESSIONS_PATH) as f:
+        with open(SESSIONS_PATH, encoding="utf-8") as f:
             sessions = json.load(f)
     except (OSError, json.JSONDecodeError):
         return {}
@@ -1654,7 +1823,7 @@ def _save_sessions(sessions: dict) -> None:
     os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
     tmp = None
     try:
-        with tempfile.NamedTemporaryFile(mode="w", dir=RUNTIME_DIR,
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=RUNTIME_DIR,
                                          prefix="sessions-", delete=False) as f:
             tmp = f.name
             json.dump(sessions, f, indent=2)
@@ -1666,26 +1835,37 @@ def _save_sessions(sessions: dict) -> None:
 
 def _update_session(session_id: str, verb: str, value: str | None = None) -> None:
     os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
+    _restrict_to_user(RUNTIME_DIR)
     fd = os.open(SESSIONS_PATH + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
     with os.fdopen(fd, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        sessions = _load_sessions()
-        entry = sessions.setdefault(session_id, {})
-        if verb in ("on", "off"):
-            entry["enabled"] = verb == "on"
-        elif verb in ("voice", "provider"):
-            entry[verb] = value
-        else:
-            entry.clear()
-        if entry:
-            entry["t"] = time.time()
-        else:
-            sessions.pop(session_id, None)
-        _save_sessions(sessions)
+        _lock_file(lock)
+        try:
+            sessions = _load_sessions()
+            entry = sessions.setdefault(session_id, {})
+            if verb in ("on", "off"):
+                entry["enabled"] = verb == "on"
+            elif verb in ("voice", "provider"):
+                entry[verb] = value
+            else:
+                entry.clear()
+            if entry:
+                entry["t"] = time.time()
+            else:
+                sessions.pop(session_id, None)
+            _save_sessions(sessions)
+        finally:
+            # Windows may release a lock some time after close; don't wait.
+            _unlock_file(lock)
 
 
 def _project_key(cwd: str | None) -> str:
     return os.path.realpath(os.path.expanduser(cwd or os.getcwd()))
+
+
+def _path_within(path: str, root: str) -> bool:
+    """True if `path` is `root` or below it (case-insensitive on Windows)."""
+    path, root = os.path.normcase(path), os.path.normcase(root)
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
 
 
 def voice_rule(cfg: dict, session_id: str | None = None, cwd: str | None = None) -> dict:
@@ -1700,7 +1880,7 @@ def voice_rule(cfg: dict, session_id: str | None = None, cwd: str | None = None)
     best = ""
     for path, project in (cfg.get("projects") or {}).items():
         root = _project_key(path)
-        if (cwd == root or cwd.startswith(root.rstrip("/") + "/")) and len(root) > len(best):
+        if _path_within(cwd, root) and len(root) > len(best):
             best = root
             match = project
     if best:
@@ -1725,15 +1905,52 @@ def _read_hook_json() -> dict:
         return {}
 
 
+def _read_daemon_addr() -> tuple[int, str]:
+    """(port, token) published by a TCP daemon; OSError if missing or invalid."""
+    try:
+        with open(ADDR_PATH, encoding="utf-8") as f:
+            addr = json.load(f)
+        return int(addr["port"]), str(addr["token"])
+    except (ValueError, KeyError, TypeError) as e:
+        raise OSError(f"bad daemon address file: {e}") from e
+
+
+def _write_private(path: str, content: str) -> None:
+    """Atomically write a file only the current user can read."""
+    _restrict_to_user(os.path.dirname(path))
+    tmp = f"{path}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.replace(tmp, path)
+
+
+def _daemon_connect(timeout: float) -> tuple[socket.socket, str]:
+    """Open a connection to the daemon. Returns (socket, auth token or "")."""
+    if not DAEMON_TCP:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(SOCK_PATH)
+        return s, ""
+    port, token = _read_daemon_addr()
+    s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    s.settimeout(timeout)
+    return s, token
+
+
+def _encode_request(payload: dict, token: str) -> bytes:
+    if token:
+        payload = dict(payload, token=token)
+    return json.dumps(payload).encode() + b"\n"
+
+
 def _daemon_alive() -> bool:
     """Return True if a daemon is reachable on the socket."""
-    if not os.path.exists(SOCK_PATH):
+    if not os.path.exists(ADDR_PATH if DAEMON_TCP else SOCK_PATH):
         return False
     try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(0.5)
-        s.connect(SOCK_PATH)
-        s.sendall(json.dumps({"op": "ping"}).encode() + b"\n")
+        s, token = _daemon_connect(0.5)
+        s.sendall(_encode_request({"op": "ping"}, token))
         resp = s.recv(256)
         s.close()
         return b'"ok"' in resp
@@ -1745,23 +1962,30 @@ def _spawn_daemon() -> None:
     """Spawn the daemon process detached. Returns immediately."""
     os.makedirs(RUNTIME_DIR, exist_ok=True)
     log = open(LOG_PATH, "a")
-    subprocess.Popen(
-        [sys.executable, SCRIPT_PATH, "--daemon"],
-        stdin=subprocess.DEVNULL,
-        stdout=log,
-        stderr=log,
-        start_new_session=True,
-        close_fds=True,
-    )
+    if not WINDOWS:
+        detach = {"start_new_session": True}
+    else:
+        # No console window; leave Claude Code's job object (if allowed) so
+        # the daemon outlives the hook process that started it.
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        detach = {"creationflags": flags | subprocess.CREATE_BREAKAWAY_FROM_JOB}
+    cmd = [sys.executable, SCRIPT_PATH, "--daemon"]
+    try:
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                         close_fds=True, **detach)
+    except PermissionError:
+        if not WINDOWS:
+            raise
+        # The job forbids breakaway; the daemon then lives as long as the job.
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                         close_fds=True, creationflags=flags)
 
 
 def _send_to_daemon(payload: dict, timeout: float = 2.0) -> dict | None:
     """Send a request to the daemon. Returns the parsed response or None."""
     try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect(SOCK_PATH)
-        s.sendall(json.dumps(payload).encode() + b"\n")
+        s, token = _daemon_connect(timeout)
+        s.sendall(_encode_request(payload, token))
         buf = b""
         while b"\n" not in buf and len(buf) < 8192:
             chunk = s.recv(4096)
@@ -1805,6 +2029,13 @@ def _handle_client(conn: socket.socket) -> None:
         if not line:
             return
         req = json.loads(line.decode("utf-8", errors="replace"))
+        if DAEMON_TCP and not hmac.compare_digest(
+                str(req.get("token", "")).encode(), _daemon_token.encode()):
+            # Any local process can reach a TCP port; only the token holder
+            # (a user who can read ADDR_PATH) may drive the daemon.
+            _daemon_log("rejected request with a bad token")
+            conn.sendall(json.dumps({"error": "unauthorized"}).encode() + b"\n")
+            return
         _daemon_idle_t0 = time.monotonic()
 
         op = req.get("op", "speak")
@@ -1816,6 +2047,12 @@ def _handle_client(conn: socket.socket) -> None:
         if op == "shutdown":
             conn.sendall(json.dumps({"ok": True}).encode() + b"\n")
             _daemon_log("shutdown requested")
+            if WINDOWS:
+                # os.kill(SIGTERM) is TerminateProcess here and would skip
+                # cleanup, leaving a stale address file behind.
+                conn.close()
+                _remove_daemon_files()
+                os._exit(0)
             os.kill(os.getpid(), signal.SIGTERM)
             return
 
@@ -1926,7 +2163,8 @@ def _handle_client(conn: socket.socket) -> None:
         tty_path = req.get("tty_path") or "/dev/tty"
         override = bool(req.get("override"))
         record_history = bool(req.get("record_history", True))
-        render = bool(req.get("render", True))
+        # A detached Windows daemon has no way to draw in the client's console.
+        render = bool(req.get("render", True)) and not WINDOWS
 
         if not text.strip():
             conn.sendall(json.dumps({"error": "empty"}).encode() + b"\n")
@@ -1994,6 +2232,38 @@ def _handle_client(conn: socket.socket) -> None:
             pass
 
 
+def _daemon_listen() -> socket.socket:
+    """Bind and listen. Unix socket mode 0600, or localhost TCP plus a token."""
+    global _daemon_token
+    if not DAEMON_TCP:
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(SOCK_PATH)
+        os.chmod(SOCK_PATH, 0o600)
+        srv.listen(8)
+        _daemon_log(f"listening on {SOCK_PATH}")
+        return srv
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        # Windows: stop another process from binding the same port over us.
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    port = srv.getsockname()[1]
+    _daemon_token = secrets.token_hex(32)
+    # Publish only once listening, so a client that reads it can connect.
+    _write_private(ADDR_PATH, json.dumps({"port": port, "token": _daemon_token}))
+    _daemon_log(f"listening on 127.0.0.1:{port}")
+    return srv
+
+
+def _remove_daemon_files() -> None:
+    for path in (ADDR_PATH if DAEMON_TCP else SOCK_PATH, PID_PATH):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def cmd_daemon(args=None) -> None:
     """Run as TTS daemon. Warms the local model once, serves the Unix socket."""
     global _daemon_idle_t0
@@ -2004,9 +2274,9 @@ def cmd_daemon(args=None) -> None:
         return
     # Two hooks can spawn daemons at once; the socket isn't bound until the
     # model loads, so only the lock keeps the second from unlinking the first.
-    lock = open(SOCK_PATH + ".lock", "w")
+    lock = open(SOCK_PATH + ".lock", "a")
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_file(lock, blocking=False)
     except OSError:
         _daemon_log("another daemon is starting, exiting")
         return
@@ -2014,7 +2284,7 @@ def cmd_daemon(args=None) -> None:
 
     # Stale socket cleanup — a prior daemon that crashed without unlinking.
     try:
-        os.unlink(SOCK_PATH)
+        os.unlink(ADDR_PATH if DAEMON_TCP else SOCK_PATH)
     except FileNotFoundError:
         pass
 
@@ -2035,21 +2305,13 @@ def cmd_daemon(args=None) -> None:
         except ProviderError as e:
             _daemon_log(f"kokoro unavailable ({e}) — serving anyway")
 
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    srv.bind(SOCK_PATH)
-    os.chmod(SOCK_PATH, 0o600)
-    srv.listen(8)
+    srv = _daemon_listen()
     srv.settimeout(5.0)
-    _daemon_log(f"listening on {SOCK_PATH}")
 
     _daemon_idle_t0 = time.monotonic()
 
     def _cleanup(*_args):
-        for path in (SOCK_PATH, PID_PATH):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+        _remove_daemon_files()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _cleanup)
@@ -2076,6 +2338,11 @@ def cmd_daemon(args=None) -> None:
 def _invoker() -> str:
     # Absolute path: hook environments don't always share the shell's PATH.
     exe = shutil.which("claude-voice")
+    if WINDOWS:
+        # Claude Code runs hooks through Git Bash: backslashes would be eaten
+        # and characters like "(" in a profile path would be shell syntax.
+        parts = [exe] if exe else [sys.executable, SCRIPT_PATH]
+        return " ".join('"' + p.replace("\\", "/") + '"' for p in parts)
     if exe and " " not in exe:
         return exe
     py = sys.executable
@@ -2086,7 +2353,7 @@ def _invoker() -> str:
 
 SLASH_TEMPLATE = """---
 description: "Control voice output: stop, pause, resume, session|project on|off|voice <name>, default on|off, on, off, mute, status, pronounce <term> <spoken>, provider <name>, voice <name>, speed <x>, volume <x>, theme <name>, history on|off, voices"
-allowed-tools: "Bash({invoker} slash:*)"
+allowed-tools: {allowed_tools}
 ---
 
 ## Voice control result
@@ -2102,7 +2369,7 @@ to fix it.
 def _load_settings() -> dict:
     if os.path.exists(SETTINGS_PATH):
         try:
-            with open(SETTINGS_PATH) as f:
+            with open(SETTINGS_PATH, encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError):
             pass
@@ -2111,7 +2378,7 @@ def _load_settings() -> dict:
 
 def _save_settings(settings: dict):
     os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
-    with open(SETTINGS_PATH, "w") as f:
+    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
 
 
@@ -2158,8 +2425,10 @@ def cmd_setup(args=None):
     _save_settings(settings)
 
     os.makedirs(os.path.dirname(COMMAND_PATH), exist_ok=True)
-    with open(COMMAND_PATH, "w") as f:
-        f.write(SLASH_TEMPLATE.format(invoker=invoker))
+    with open(COMMAND_PATH, "w", encoding="utf-8") as f:
+        # JSON-escaped, so a quoted invoker still yields a valid YAML string.
+        allowed = json.dumps(f"Bash({invoker} slash:*)")
+        f.write(SLASH_TEMPLATE.format(invoker=invoker, allowed_tools=allowed))
 
     provider = cfg.get("provider", "kokoro")
     print(f"\n  {GREEN}✓{RESET} {BOLD}claude-voice v{VERSION} installed{RESET}")
@@ -2292,6 +2561,21 @@ def _list_system_voices() -> dict:
                 if m and m.group(2).startswith("en"):
                     voices[m.group(1)] = m.group(3)[:50]
             return dict(list(voices.items())[:14]) or {"(system default)": "leave voice unset"}
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    elif WINDOWS and _powershell():
+        script = ("[Console]::OutputEncoding = [Text.Encoding]::UTF8;"
+                  "Add-Type -AssemblyName System.Speech;"
+                  "(New-Object System.Speech.Synthesis.SpeechSynthesizer).GetInstalledVoices()"
+                  " | ForEach-Object { $_.VoiceInfo.Name + '|' + $_.VoiceInfo.Culture"
+                  " + ', ' + $_.VoiceInfo.Gender }")
+        try:
+            out = subprocess.run([_powershell(), "-NoProfile", "-NonInteractive", "-Command", script],
+                                 capture_output=True, encoding="utf-8", errors="replace",
+                                 timeout=15).stdout
+            voices = dict(line.split("|", 1) for line in out.splitlines() if "|" in line)
+            if voices:
+                return voices
         except (OSError, subprocess.TimeoutExpired):
             pass
     return {"(system default)": "leave voice unset"}
@@ -2496,16 +2780,22 @@ def cmd_clip(args=None) -> None:
     because it's explicitly user-initiated.
     """
     text = ""
-    for cmd in (["pbpaste"], ["wl-paste", "--no-newline"],
-                ["xclip", "-selection", "clipboard", "-o"]):
+    tools = [["pbpaste"], ["wl-paste", "--no-newline"],
+             ["xclip", "-selection", "clipboard", "-o"]]
+    if WINDOWS:
+        tools = [["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                  "[Console]::OutputEncoding = [Text.Encoding]::UTF8; Get-Clipboard -Raw"]]
+    for cmd in tools:
         if shutil.which(cmd[0]):
             try:
-                text = subprocess.run(cmd, capture_output=True, text=True, timeout=2.0).stdout
+                # PowerShell needs a few seconds to start on a cold machine.
+                text = subprocess.run(cmd, capture_output=True, encoding="utf-8",
+                                      errors="replace", timeout=10.0 if WINDOWS else 2.0).stdout
                 break
             except (subprocess.TimeoutExpired, OSError):
                 continue
     else:
-        print(f"  {RED}✗{RESET} no clipboard tool found (pbpaste / wl-paste / xclip)")
+        print(f"  {RED}✗{RESET} no clipboard tool found (pbpaste / wl-paste / xclip / powershell)")
         return
 
     text = clean_for_speech(text or "")
@@ -2760,8 +3050,11 @@ def cmd_doctor(args=None):
         except Exception:
             ok_dev = False
         check("audio output device", ok_dev, "no output device found")
-    check("ffmpeg (decodes cloud mp3 audio)", bool(shutil.which("ffmpeg")), "brew install ffmpeg")
-    if sys.platform != "darwin":
+    check("ffmpeg (decodes cloud mp3 audio)", bool(shutil.which("ffmpeg")),
+          "winget install ffmpeg" if WINDOWS else "brew install ffmpeg")
+    if WINDOWS:
+        check("PowerShell (system provider)", bool(_powershell()), "PowerShell is missing")
+    elif sys.platform != "darwin":
         check("espeak-ng (system provider)", bool(shutil.which("espeak-ng") or shutil.which("espeak")),
               "apt install espeak-ng")
     check("Stop hook installed", _hook_installed(), "claude-voice setup")
@@ -2966,6 +3259,8 @@ COMMANDS = {
 
 
 def main():
+    if WINDOWS:
+        _prepare_windows_console()
     load_config()
 
     if len(sys.argv) >= 2 and sys.argv[1] in COMMANDS:
