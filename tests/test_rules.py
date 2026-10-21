@@ -83,7 +83,14 @@ class SpeedRuleCommandTests(unittest.TestCase):
     def test_project_speed_is_saved_and_shown(self):
         out = self.slash("project", "speed", "1.1x")
         self.assertEqual(self.cfg["projects"][self.root], {"speed": 1.1})
-        self.assertIn("1.1x (from project", out)
+        self.assertIn("1.1x · 100% (from project", out)
+
+    def test_project_volume_accepts_percent_and_zero(self):
+        out = self.slash("project", "volume", "70%")
+        self.assertEqual(self.cfg["projects"][self.root], {"volume": 0.7})
+        self.assertIn("· 70% (from project", out)
+        self.slash("project", "volume", "0")
+        self.assertEqual(cv.voice_rule(self.cfg, None, self.root)["volume"], 0.0)
 
     def test_session_speed_overrides_and_clears(self):
         self.slash("session", "speed", "0.9")
@@ -100,6 +107,13 @@ class SpeedRuleCommandTests(unittest.TestCase):
         self.assertEqual(cv.parse_speed("0.1×"), 0.25)
         with self.assertRaises(ValueError):
             cv.parse_speed("nan")
+
+    def test_volumes_read_as_gain_or_percent_and_are_clamped(self):
+        self.assertEqual(cv.parse_volume("0.7"), 0.7)
+        self.assertEqual(cv.parse_volume("70%"), 0.7)
+        self.assertEqual(cv.parse_volume("500"), 2.0)
+        with self.assertRaises(ValueError):
+            cv.parse_volume("inf")
 
 
 if __name__ == "__main__":

@@ -186,21 +186,22 @@ def test_hooks_wait_out_a_slow_daemon_start_instead_of_speaking_in_process(
     speak.assert_not_called()
 
 
-def test_rule_speed_travels_from_hook_through_daemon(monkeypatch):
+def test_rule_speed_and_volume_travel_from_hook_through_daemon(monkeypatch):
     payload = '{"session_id": "s1", "last_assistant_message": "' + "Long enough reply. " * 3 + '"}'
     monkeypatch.setattr(cv.sys, "argv", ["claude-voice"])
     monkeypatch.setattr(cv.sys, "stdin", mock.Mock(isatty=lambda: False, read=lambda: payload))
     monkeypatch.setattr(cv, "load_config", cv.default_config)
     monkeypatch.setattr(cv, "_turn_was_voice_command", lambda hook: False)
     monkeypatch.setattr(cv, "voice_rule", lambda *a: {"enabled": True, "voice": None,
-                                                      "provider": None, "speed": 0.9})
+                                                      "provider": None, "speed": 0.9,
+                                                      "volume": 0.0})
     monkeypatch.setattr(cv, "_resolve_tty", lambda: "/dev/null")
     monkeypatch.setattr(cv, "_ensure_daemon", lambda wait: True)
     sent = []
     monkeypatch.setattr(cv, "_send_to_daemon", lambda p, **k: sent.append(p) or {"queued": True})
     with pytest.raises(SystemExit):
         cv.main()
-    assert sent[0]["speed"] == 0.9
+    assert (sent[0]["speed"], sent[0]["volume"]) == (0.9, 0.0)
 
     monkeypatch.setattr(cv, "reload_config", cv.default_config)
     monkeypatch.setattr(cv, "_daemon_log", lambda message: None)
@@ -210,7 +211,22 @@ def test_rule_speed_travels_from_hook_through_daemon(monkeypatch):
     conn = mock.Mock()
     conn.recv.return_value = json.dumps(dict(sent[0], override=True)).encode() + b"\n"
     cv._handle_client(conn)
-    assert speak.call_args.kwargs["speed"] == 0.9
+    assert (speak.call_args.kwargs["speed"], speak.call_args.kwargs["volume"]) == (0.9, 0.0)
+
+
+def test_rule_volume_reaches_synthesis(monkeypatch):
+    seen = []
+
+    def pieces(provider, text, voice, speed, cfg):
+        seen.append(cfg["volume"])
+        return iter(())
+
+    monkeypatch.setattr(cv, "load_config", cv.default_config)
+    monkeypatch.setattr(cv, "_synth_pieces", pieces)
+    monkeypatch.setattr(cv, "sd", mock.Mock())
+    cv.speak_and_highlight("Hello.", provider="kokoro", record_history=False,
+                           render=False, volume=0.4)
+    assert seen == [0.4]
 
 
 @pytest.mark.parametrize("command", [cv.cmd_demo, cv.cmd_benchmark])

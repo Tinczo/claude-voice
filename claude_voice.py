@@ -1612,9 +1612,11 @@ def _synth_pieces(provider: str, text: str, voice: str, speed: float, cfg: dict)
 def speak_and_highlight(text: str, provider: str | None = None, voice: str | None = None,
                         show_stats: bool = False, tty_path: str = "/dev/tty",
                         record_history: bool = True, render: bool = True,
-                        speed: float | None = None) -> dict:
+                        speed: float | None = None, volume: float | None = None) -> dict:
     global _interrupted, _player
     cfg = load_config()
+    if volume is not None:
+        cfg = dict(cfg, volume=volume)  # synthesis reads the volume from cfg
     provider = provider or cfg.get("provider", "kokoro")
     voice = voice or current_voice(cfg, provider)
     speed = float(speed or cfg.get("speed", 1.0))
@@ -1935,7 +1937,7 @@ def _update_session(session_id: str, verb: str, value: str | float | None = None
             entry = sessions.setdefault(session_id, {})
             if verb in ("on", "off"):
                 entry["enabled"] = verb == "on"
-            elif verb in ("voice", "provider", "speed"):
+            elif verb in ("voice", "provider", "speed", "volume"):
                 entry[verb] = value
             else:
                 entry.clear()
@@ -1959,7 +1961,7 @@ def _path_within(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
 
 
-RULE_KEYS = ("enabled", "voice", "provider", "speed")
+RULE_KEYS = ("enabled", "voice", "provider", "speed", "volume")
 
 
 def parse_speed(value: str) -> float:
@@ -1970,14 +1972,22 @@ def parse_speed(value: str) -> float:
     return max(0.25, min(4.0, speed))
 
 
+def parse_volume(value: str) -> float:
+    """"0.7", "70" or "70%" -> a gain clamped to 0.0-2.0 (above 2 means percent)."""
+    volume = float(value.rstrip("%"))
+    if not math.isfinite(volume):
+        raise ValueError("volume must be a number")
+    return max(0.0, min(2.0, volume / 100.0 if volume > 2 else volume))
+
+
 def voice_rule(cfg: dict, session_id: str | None = None, cwd: str | None = None) -> dict:
-    """Effective {enabled, voice, provider, speed, source} for one Claude Code session.
+    """Effective {enabled, voice, provider, speed, volume, source} for one session.
 
     Precedence: session override > project rule (longest matching directory)
-    > "default_enabled". voice/provider/speed None means the global setting.
+    > "default_enabled". voice/provider/speed/volume None means the global setting.
     """
     rule = {"enabled": cfg.get("default_enabled", True), "voice": None,
-            "provider": None, "speed": None, "source": "default"}
+            "provider": None, "speed": None, "volume": None, "source": "default"}
     cwd = _project_key(cwd)
     best = ""
     for path, project in (cfg.get("projects") or {}).items():
@@ -2269,8 +2279,9 @@ def _handle_client(conn: socket.socket) -> None:
         record_history = bool(req.get("record_history", True))
         # A detached Windows daemon has no way to draw in the client's console.
         render = bool(req.get("render", True)) and not WINDOWS
-        # Per-session/project speed from the hook; None means the global one.
+        # Per-session/project speed and volume from the hook; None means global.
         speed = parse_speed(str(req["speed"])) if req.get("speed") else None
+        volume = parse_volume(str(req["volume"])) if req.get("volume") is not None else None
 
         if not text.strip():
             conn.sendall(json.dumps({"error": "empty"}).encode() + b"\n")
@@ -2311,7 +2322,8 @@ def _handle_client(conn: socket.socket) -> None:
             _daemon_log(f"speak: {tty_path} · {len(text)} chars · {provider}/{voice}")
             try:
                 speak_and_highlight(text, provider=provider, voice=voice, tty_path=tty_path,
-                                    record_history=record_history, render=render, speed=speed)
+                                    record_history=record_history, render=render, speed=speed,
+                                    volume=volume)
             except Exception as e:
                 # The audio output device (e.g. Bluetooth headphones) likely
                 # changed under us — PortAudio holds a stale handle to it.
@@ -2323,7 +2335,8 @@ def _handle_client(conn: socket.socket) -> None:
                         sd._initialize()
                     _interrupted = False
                     speak_and_highlight(text, provider=provider, voice=voice, tty_path=tty_path,
-                                        record_history=False, render=render, speed=speed)
+                                        record_history=False, render=render, speed=speed,
+                                        volume=volume)
                 except Exception as e2:
                     _daemon_log(f"retry failed: {e2}")
     except (json.JSONDecodeError, OSError, ValueError) as e:
@@ -2465,7 +2478,7 @@ def _invoker() -> str:
 
 
 SLASH_TEMPLATE = """---
-description: "Control voice output: stop, pause, resume, session|project on|off|voice <name>|speed <x>, default on|off, on, off, mute, status, pronounce <term> <spoken>, provider <name>, voice <name>, speed <x>, volume <x>, theme <name>, history on|off, voices"
+description: "Control voice output: stop, pause, resume, session|project on|off|voice <name>|speed <x>|volume <x>, default on|off, on, off, mute, status, pronounce <term> <spoken>, provider <name>, voice <name>, speed <x>, volume <x>, theme <name>, history on|off, voices"
 allowed-tools: {allowed_tools}
 ---
 
@@ -3235,8 +3248,9 @@ def cmd_slash(args):
         provider = rule["provider"] or cfg.get("provider", "kokoro")
         voice = rule["voice"] or current_voice(cfg, provider)
         speed = rule["speed"] or cfg.get("speed", 1.0)
+        volume = cfg.get("volume", 1.0) if rule["volume"] is None else rule["volume"]
         return (f"this session: {'SPEAKS' if rule['enabled'] else 'SILENT'} · {provider}/{voice} "
-                f"· {speed}x (from {rule['source']})")
+                f"· {speed}x · {round(volume * 100)}% (from {rule['source']})")
 
     def set_rule(scope: str, rest: list[str]) -> str:
         if not rest:
@@ -3256,10 +3270,13 @@ def cmd_slash(args):
             entry["provider"] = resolve_provider(rest[1])
         elif verb == "speed" and len(rest) > 1:
             entry["speed"] = parse_speed(rest[1])
+        elif verb == "volume" and len(rest) > 1:
+            entry["volume"] = parse_volume(rest[1])
         elif verb in ("clear", "reset"):
             entry.clear()
         else:
-            return f"usage: /voice {scope} on|off|voice <name>|provider <name>|speed <x>|clear"
+            return (f"usage: /voice {scope} on|off|voice <name>|provider <name>|speed <x>|"
+                    "volume <x>|clear")
         if scope == "session":
             _update_session(session_id, verb, entry.get(verb))
         else:
@@ -3304,8 +3321,7 @@ def cmd_slash(args):
             save_config(cfg)
             print(f"speed set to {cfg['speed']}x")
         elif action == "volume" and rest:
-            v = float(rest[0].rstrip("%"))
-            cfg["volume"] = max(0.0, min(2.0, v / 100.0 if v > 2 else v))
+            cfg["volume"] = parse_volume(rest[0])
             save_config(cfg)
             print(f"volume set to {int(cfg['volume'] * 100)}%")
         elif action == "theme" and rest and rest[0].lower() in THEMES:
@@ -3358,7 +3374,7 @@ def cmd_slash(args):
             print("providers: " + ", ".join(f"{p} ({PROVIDERS[p]['blurb']})" for p in PROVIDERS))
         else:
             print("usage: /voice [on|off|toggle|mute|unmute|status|stop|pause|resume|pronounce <term> <spoken>|"
-                  "session on|off|voice <v>|speed <x>|clear|project on|off|voice <v>|speed <x>|clear|default on|off|"
+                  "session|project on|off|voice <v>|speed <x>|volume <x>|clear|default on|off|"
                   "provider <name>|voice <name>|"
                   "speed <x>|volume <x>|theme <name>|announce on|off|history on|off|voices|providers]")
     except (ProviderError, ValueError) as e:
@@ -3445,7 +3461,7 @@ def main():
     text = None
     hook_mode = False
     voice = args.voice
-    speed = None
+    speed = volume = None
     if args.text:
         text = " ".join(args.text)
     elif not sys.stdin.isatty():
@@ -3466,7 +3482,7 @@ def main():
             if rule["provider"] and not provider:
                 provider = resolve_provider(rule["provider"])
             voice = voice or rule["voice"]
-            speed = rule["speed"]
+            speed, volume = rule["speed"], rule["volume"]
         text = extract_hook_text(raw)
         if text and is_mostly_code(text):
             sys.exit(0)
@@ -3502,6 +3518,7 @@ def main():
             "provider": provider or cfg.get("provider", "kokoro"),
             "voice": voice,
             "speed": speed,
+            "volume": volume,
             "tty_path": tty_path,
             "render": render,
         }, timeout=5.0)
@@ -3514,7 +3531,7 @@ def main():
 
     try:
         result = speak_and_highlight(text, provider=provider, voice=voice, tty_path=tty_path,
-                                     render=render, speed=speed)
+                                     render=render, speed=speed, volume=volume)
         if "error" in result and not hook_mode:
             sys.exit(1)
     except Exception as e:
