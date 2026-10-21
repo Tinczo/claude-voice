@@ -1,5 +1,6 @@
 """Per-session and per-project rules for which sessions speak, in which voice."""
 
+import io
 import os
 import tempfile
 import time
@@ -44,10 +45,61 @@ class VoiceRuleTests(unittest.TestCase):
         self.assertTrue(rule["enabled"])
         self.assertEqual(rule["voice"], "bm_george")
 
+    def test_speed_follows_the_same_precedence(self):
+        cfg = dict(self.cfg, projects={self.root: {"speed": 1.0}})
+        self.assertIsNone(cv.voice_rule(dict(cfg, projects={}), None, self.root)["speed"])
+        self.assertEqual(cv.voice_rule(cfg, None, self.root)["speed"], 1.0)
+        cv._save_sessions({"s1": {"speed": 1.5, "t": time.time()}})
+        self.assertEqual(cv.voice_rule(cfg, "s1", self.root)["speed"], 1.5)
+
     def test_stale_session_overrides_expire(self):
         cv._save_sessions({"s1": {"enabled": True, "t": time.time() - cv.SESSION_TTL - 1}})
         rule = cv.voice_rule(self.cfg, "s1", os.path.join(self.root, "proj"))
         self.assertFalse(rule["enabled"])
+
+
+class SpeedRuleCommandTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = os.path.realpath(tmp.name)
+        self.cfg = cv.default_config()
+        for patcher in (
+            mock.patch.object(cv, "RUNTIME_DIR", self.root),
+            mock.patch.object(cv, "SESSIONS_PATH", os.path.join(self.root, "sessions.json")),
+            mock.patch.object(cv, "load_config", return_value=self.cfg),
+            mock.patch.object(cv, "save_config"),
+            mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "s1",
+                                         "CLAUDE_PROJECT_DIR": self.root}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def slash(self, *args):
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            cv.cmd_slash(list(args))
+        return out.getvalue()
+
+    def test_project_speed_is_saved_and_shown(self):
+        out = self.slash("project", "speed", "1.1x")
+        self.assertEqual(self.cfg["projects"][self.root], {"speed": 1.1})
+        self.assertIn("1.1x (from project", out)
+
+    def test_session_speed_overrides_and_clears(self):
+        self.slash("session", "speed", "0.9")
+        self.assertEqual(cv.voice_rule(self.cfg, "s1", self.root)["speed"], 0.9)
+        self.slash("session", "clear")
+        self.assertIsNone(cv.voice_rule(self.cfg, "s1", self.root)["speed"])
+
+    def test_bad_speed_is_reported_not_saved(self):
+        self.assertIn("error:", self.slash("project", "speed", "fast"))
+        cv.save_config.assert_not_called()
+
+    def test_speeds_are_clamped(self):
+        self.assertEqual(cv.parse_speed("9"), 4.0)
+        self.assertEqual(cv.parse_speed("0.1×"), 0.25)
+        with self.assertRaises(ValueError):
+            cv.parse_speed("nan")
 
 
 if __name__ == "__main__":

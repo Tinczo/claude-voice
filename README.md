@@ -170,9 +170,11 @@ The command runs instantly (it executes before the prompt is sent) and Claude ju
 /voice session off               silence this Claude Code session
 /voice session voice af_heart    override its voice
 /voice session provider kokoro   override its provider
+/voice session speed 1.2         override its speed
 /voice session clear             remove this session's overrides
 /voice project off               silence this project and its subdirectories
 /voice project voice am_fenrir   set a project voice
+/voice project speed 1.0         set a project speed
 /voice project clear             remove this project's overrides
 /voice default off               silence sessions without an enabling rule
 /voice pronounce pytest pie test add a pronunciation for local speech

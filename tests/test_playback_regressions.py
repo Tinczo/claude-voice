@@ -1,5 +1,6 @@
 """Initial controls and failures after the first streamed audio chunk."""
 
+import json
 import threading
 from types import SimpleNamespace
 from unittest import mock
@@ -183,6 +184,33 @@ def test_hooks_wait_out_a_slow_daemon_start_instead_of_speaking_in_process(
         cv.main()
     ensure.assert_called_once_with(wait)
     speak.assert_not_called()
+
+
+def test_rule_speed_travels_from_hook_through_daemon(monkeypatch):
+    payload = '{"session_id": "s1", "last_assistant_message": "' + "Long enough reply. " * 3 + '"}'
+    monkeypatch.setattr(cv.sys, "argv", ["claude-voice"])
+    monkeypatch.setattr(cv.sys, "stdin", mock.Mock(isatty=lambda: False, read=lambda: payload))
+    monkeypatch.setattr(cv, "load_config", cv.default_config)
+    monkeypatch.setattr(cv, "_turn_was_voice_command", lambda hook: False)
+    monkeypatch.setattr(cv, "voice_rule", lambda *a: {"enabled": True, "voice": None,
+                                                      "provider": None, "speed": 0.9})
+    monkeypatch.setattr(cv, "_resolve_tty", lambda: "/dev/null")
+    monkeypatch.setattr(cv, "_ensure_daemon", lambda wait: True)
+    sent = []
+    monkeypatch.setattr(cv, "_send_to_daemon", lambda p, **k: sent.append(p) or {"queued": True})
+    with pytest.raises(SystemExit):
+        cv.main()
+    assert sent[0]["speed"] == 0.9
+
+    monkeypatch.setattr(cv, "reload_config", cv.default_config)
+    monkeypatch.setattr(cv, "_daemon_log", lambda message: None)
+    monkeypatch.setattr(cv, "_player", None)
+    speak = mock.Mock()
+    monkeypatch.setattr(cv, "speak_and_highlight", speak)
+    conn = mock.Mock()
+    conn.recv.return_value = json.dumps(dict(sent[0], override=True)).encode() + b"\n"
+    cv._handle_client(conn)
+    assert speak.call_args.kwargs["speed"] == 0.9
 
 
 @pytest.mark.parametrize("command", [cv.cmd_demo, cv.cmd_benchmark])
