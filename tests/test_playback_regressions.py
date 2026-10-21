@@ -160,6 +160,31 @@ def test_direct_cli_failure_exits_nonzero(monkeypatch, error):
     assert result.value.code == 1
 
 
+@pytest.mark.parametrize("hook_mode, wait", [(True, cv.HOOK_SPAWN_WAIT),
+                                             (False, cv.DAEMON_SPAWN_WAIT)])
+def test_hooks_wait_out_a_slow_daemon_start_instead_of_speaking_in_process(
+        monkeypatch, hook_mode, wait):
+    # In-process speech can't be reached by /voice stop, so a hook waits for
+    # the daemon; a manual run keeps the short wait.
+    payload = '{"last_assistant_message": "' + "A reply long enough to speak. " * 3 + '"}'
+    stdin = mock.Mock(isatty=lambda: not hook_mode, read=lambda: payload)
+    argv = ["claude-voice"] if hook_mode else ["claude-voice", "Hello there."]
+    monkeypatch.setattr(cv.sys, "argv", argv)
+    monkeypatch.setattr(cv.sys, "stdin", stdin)
+    monkeypatch.setattr(cv, "load_config", cv.default_config)
+    monkeypatch.setattr(cv, "_resolve_tty", lambda: "/dev/null")
+    monkeypatch.setattr(cv.os, "isatty", lambda fd: False)
+    ensure = mock.Mock(return_value=True)
+    monkeypatch.setattr(cv, "_ensure_daemon", ensure)
+    monkeypatch.setattr(cv, "_send_to_daemon", lambda *a, **k: {"queued": True})
+    speak = mock.Mock()
+    monkeypatch.setattr(cv, "speak_and_highlight", speak)
+    with pytest.raises(SystemExit):
+        cv.main()
+    ensure.assert_called_once_with(wait)
+    speak.assert_not_called()
+
+
 @pytest.mark.parametrize("command", [cv.cmd_demo, cv.cmd_benchmark])
 @pytest.mark.parametrize("failed", [True, False])
 def test_demo_and_benchmark_do_not_summarize_incomplete_playback(monkeypatch, capsys,

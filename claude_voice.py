@@ -124,6 +124,9 @@ SESSIONS_PATH = os.path.join(RUNTIME_DIR, "sessions.json")
 SESSION_TTL = 7 * 86400               # forget per-session overrides after a week
 DAEMON_IDLE_TIMEOUT = 1800            # seconds before idle daemon exits
 DAEMON_SPAWN_WAIT = 15                # max seconds to wait for cold-spawned daemon
+# Hooks run async (setup gives them 120 s), so they can wait out a slow first
+# model load. Speaking in-process instead is out of reach of /voice stop.
+HOOK_SPAWN_WAIT = 100
 ACTIVE_TTY_STALE = 600                # claim auto-expires after 10 min
 
 # ── dev pronunciation fixes (local engines only — cloud models handle these) ──
@@ -3473,7 +3476,7 @@ def main():
     owns_tty = any(os.isatty(fd) for fd in (0, 1, 2))
     render = owns_tty if not hook_mode else cfg.get("hook_karaoke", False)
 
-    if use_daemon and _ensure_daemon():
+    if use_daemon and _ensure_daemon(HOOK_SPAWN_WAIT if hook_mode else DAEMON_SPAWN_WAIT):
         resp = _send_to_daemon({
             "op": "speak",
             "text": text,
