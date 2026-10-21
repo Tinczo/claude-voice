@@ -1965,9 +1965,11 @@ def _spawn_daemon() -> None:
     if not WINDOWS:
         detach = {"start_new_session": True}
     else:
-        # No console window; leave Claude Code's job object (if allowed) so
-        # the daemon outlives the hook process that started it.
-        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        # A hidden console, not DETACHED_PROCESS: a venv python.exe is a
+        # launcher, and its console-less child would get a new visible window
+        # (closing it kills the daemon). Also leave Claude Code's job object,
+        # if allowed, so the daemon outlives the hook that started it.
+        flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
         detach = {"creationflags": flags | subprocess.CREATE_BREAKAWAY_FROM_JOB}
     cmd = [sys.executable, SCRIPT_PATH, "--daemon"]
     try:
