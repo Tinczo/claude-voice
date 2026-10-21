@@ -7,7 +7,8 @@ Claude talks back — local by default, cloud voices when you want them.
 
 Providers:
     kokoro       Local, free, no API key (Kokoro 82M, runs on CPU)
-    system       Your OS voice (macOS `say` / espeak) — zero install
+    piper        Local, free, many languages (Piper voices, e.g. Polish)
+    system       Your OS voice (macOS `say` / espeak / Windows SAPI) — zero install
     openai       OpenAI TTS (gpt-4o-mini-tts / tts-1)
     elevenlabs   ElevenLabs — with true word-level karaoke timestamps
     grok         xAI Grok TTS (api.x.ai)
@@ -109,6 +110,7 @@ SCRIPT_PATH = os.path.abspath(__file__)
 
 # ── daemon / runtime state ──
 RUNTIME_DIR = os.path.expanduser("~/.cache/claude-voice")
+PIPER_DIR = os.path.join(RUNTIME_DIR, "piper")  # downloaded Piper voice models
 SOCK_PATH = os.path.join(RUNTIME_DIR, "daemon.sock")
 # Without AF_UNIX (Windows Python) the daemon listens on localhost TCP and
 # publishes its port and a per-run secret token here, readable only by you.
@@ -174,6 +176,7 @@ PROVIDER_COLORS = {
     "elevenlabs": (255, 150, 80),
     "grok":       (240, 100, 100),
     "custom":     (120, 200, 255),
+    "piper":      (130, 210, 120),
 }
 
 # ── ANSI (theme-dependent globals set by set_theme) ──
@@ -240,6 +243,18 @@ OPENAI_VOICES = {
     "fable": "British, storyteller",
     "onyx": "male, deep",
     "verse": "male, versatile",
+}
+
+# A few Piper voices; any name from huggingface.co/rhasspy/piper-voices works.
+PIPER_VOICES = {
+    "en_US-lessac-medium": "American English, neutral (default)",
+    "en_GB-alba-medium": "British English, female",
+    "pl_PL-gosia-medium": "Polish, female",
+    "pl_PL-darkman-medium": "Polish, male",
+    "pl_PL-mc_speech-medium": "Polish, male, audiobook style",
+    "de_DE-thorsten-medium": "German, male",
+    "es_ES-davefx-medium": "Spanish, male",
+    "fr_FR-siwis-medium": "French, female",
 }
 
 GROK_VOICES = {
@@ -441,6 +456,7 @@ def default_config() -> dict:
             "elevenlabs": "rachel",
             "grok": "eve",
             "custom": "alloy",
+            "piper": "en_US-lessac-medium",
         },
         "speed": 1.0,
         "volume": 1.0,
@@ -1350,6 +1366,75 @@ def synth_custom(text: str, voice: str, speed: float, cfg: dict):
     return audio, rate, None
 
 
+PIPER_URL = ("https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+             "{family}/{locale}/{speaker}/{quality}/{name}{ext}?download=true")
+# Strict: the name becomes a file name and part of the download URL.
+PIPER_VOICE_RE = re.compile(r"(?P<locale>(?P<family>[a-z]{2,3})_[A-Z]{2})-"
+                            r"(?P<speaker>[a-z0-9_]+)-(?P<quality>x_low|low|medium|high)")
+_piper_voices: dict = {}
+
+
+def _piper_paths(name: str) -> tuple[re.Match, str, str]:
+    m = PIPER_VOICE_RE.fullmatch(name)
+    if not m:
+        raise ProviderError(f"'{name}' is not a Piper voice name like pl_PL-gosia-medium "
+                            "(see huggingface.co/rhasspy/piper-voices)")
+    model = os.path.join(PIPER_DIR, name + ".onnx")
+    return m, model, model + ".json"
+
+
+def _piper_download(name: str) -> None:
+    """Fetch a voice model and its config, unless already present."""
+    m, model, config = _piper_paths(name)
+    os.makedirs(PIPER_DIR, exist_ok=True)
+    for path, ext in ((config, ".onnx.json"), (model, ".onnx")):
+        if os.path.exists(path):
+            continue
+        url = PIPER_URL.format(name=name, ext=ext, **m.groupdict())
+        tmp = f"{path}.{os.getpid()}.part"
+        try:
+            # A partial file must never look like a finished model.
+            with urllib.request.urlopen(url, timeout=60) as resp, open(tmp, "wb") as f:
+                shutil.copyfileobj(resp, f)
+            os.replace(tmp, path)
+        except urllib.error.HTTPError as e:
+            raise ProviderError(f"Piper voice '{name}' not found (HTTP {e.code})") from e
+        except (urllib.error.URLError, OSError) as e:
+            raise ProviderError(f"could not download Piper voice '{name}': {e}") from e
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+
+
+def get_piper_voice(name: str):
+    """Load (downloading on first use) and cache a Piper voice."""
+    if name not in _piper_voices:
+        try:
+            from piper import PiperVoice
+        except ImportError:
+            raise ProviderError("piper is not installed. Run: pip install piper-tts")
+        _piper_download(name)
+        _, model, config = _piper_paths(name)
+        _piper_voices[name] = PiperVoice.load(model, config_path=config)
+    return _piper_voices[name]
+
+
+def synth_piper(text: str, voice: str, speed: float, cfg: dict):
+    from piper.config import SynthesisConfig
+
+    piper_voice = get_piper_voice(voice)
+    # The pronunciation table is English developer speak; it would garble
+    # other languages ("JSON" -> "jason" read with Polish rules).
+    if voice.startswith("en_"):
+        text = fix_pronunciation(text, cfg.get("pronunciations"))
+    syn = SynthesisConfig(length_scale=1.0 / max(speed, 0.1))
+    chunks = list(piper_voice.synthesize(text, syn_config=syn))
+    if not chunks:
+        raise ProviderError("piper produced no audio")
+    audio = np.concatenate([np.asarray(c.audio_float_array, dtype=np.float32) for c in chunks])
+    return audio, chunks[0].sample_rate, None
+
+
 PROVIDERS = {
     "kokoro": {"fn": synth_kokoro, "needs_key": False, "local": True,
                "blurb": "local Kokoro 82M — free, private, no key"},
@@ -1363,6 +1448,8 @@ PROVIDERS = {
              "blurb": "xAI Grok TTS (api.x.ai)"},
     "custom": {"fn": synth_custom, "needs_key": False, "local": False,
                "blurb": "any OpenAI-compatible /audio/speech endpoint"},
+    "piper": {"fn": synth_piper, "needs_key": False, "local": True,
+              "blurb": "local Piper — free, private, many languages incl. Polish"},
 }
 
 PROVIDER_ALIASES = {
@@ -2306,6 +2393,13 @@ def cmd_daemon(args=None) -> None:
             _daemon_log(f"kokoro loaded in {time.monotonic()-t0:.2f}s")
         except ProviderError as e:
             _daemon_log(f"kokoro unavailable ({e}) — serving anyway")
+    elif load_config().get("provider") == "piper":
+        voice = current_voice(load_config(), "piper")
+        try:
+            get_piper_voice(voice)
+            _daemon_log(f"piper voice {voice} loaded")
+        except ProviderError as e:
+            _daemon_log(f"piper unavailable ({e}) — serving anyway")
 
     srv = _daemon_listen()
     srv.settimeout(5.0)
@@ -2548,6 +2642,14 @@ def cmd_voice(args):
     voice = args[0]
     if provider == "kokoro" and voice not in KOKORO_VOICES:
         print(f"  {YELLOW}!{RESET} '{voice}' is not a known kokoro voice — setting anyway")
+    if provider == "piper":
+        # Download now, with feedback, rather than silently on the next reply.
+        print(f"  {DIM}fetching Piper voice {voice} (about 60 MB on first use)…{RESET}")
+        try:
+            _piper_download(voice)
+        except ProviderError as e:
+            print(f"  {RED}✗{RESET} {e}")
+            return
     cfg.setdefault("voices", {})[provider] = voice
     save_config(cfg)
     print(f"  {GREEN}✓{RESET} {provider} voice → {CYAN}{voice}{RESET}")
@@ -2606,6 +2708,12 @@ def cmd_voices(args):
                 print(f"  {YELLOW}!{RESET} couldn't fetch account voices ({e}) — showing built-ins")
     elif target == "custom":
         catalog = {"(any)": "voice names depend on your endpoint"}
+    elif target == "piper":
+        catalog = dict(PIPER_VOICES)
+        if os.path.isdir(PIPER_DIR):
+            for f in sorted(os.listdir(PIPER_DIR)):
+                if f.endswith(".onnx"):
+                    catalog.setdefault(f[:-5], "downloaded")
     else:
         catalog = catalogs[target]
     print(f"\n  {BOLD}{target} voices{RESET}\n")
@@ -2614,6 +2722,8 @@ def cmd_voices(args):
         print(f"  {CYAN}{vid:18s}{RESET} {desc}{marker}")
     if target == "grok":
         print(f"\n  {DIM}xAI offers 80+ voices — any voice_id from docs.x.ai works here{RESET}")
+    if target == "piper":
+        print(f"\n  {DIM}any voice from huggingface.co/rhasspy/piper-voices works here{RESET}")
     print(f"\n  {DIM}set: claude-voice voice <name>{RESET}\n")
 
 
@@ -3065,6 +3175,19 @@ def cmd_doctor(args=None):
     if PROVIDERS[provider]["needs_key"]:
         check(f"API key for current provider ({provider})", bool(get_key(cfg, provider)),
               f"claude-voice key {provider} <key>")
+    if provider == "piper":
+        try:
+            import piper  # noqa: F401
+            has_piper = True
+        except ImportError:
+            has_piper = False
+        check("piper (current provider)", has_piper, 'pip install "claude-voice[piper]"')
+        voice = current_voice(cfg, "piper")
+        try:
+            downloaded = os.path.exists(_piper_paths(voice)[1])
+        except ProviderError:
+            downloaded = False
+        check(f"piper voice {voice} downloaded", downloaded, f"claude-voice voice {voice}")
     daemon = _daemon_alive()
     mark = f"{GREEN}✓{RESET}" if daemon else f"{DIM}·{RESET}"
     print(f"  {mark} daemon {'running (warm)' if daemon else 'not running — fine, spawns on first speak'}")
@@ -3151,6 +3274,8 @@ def cmd_slash(args):
             print(f"provider switched to {name} (voice: {current_voice(cfg, name) or 'default'}){note}")
         elif action == "voice" and rest:
             provider = cfg.get("provider", "kokoro")
+            if provider == "piper":
+                _piper_paths(rest[0])  # reject bad names now; download on first speak
             cfg.setdefault("voices", {})[provider] = rest[0]
             save_config(cfg)
             print(f"{provider} voice set to {rest[0]}")
@@ -3206,6 +3331,7 @@ def cmd_slash(args):
             target = cfg.get("provider", "kokoro")
             names = {"kokoro": list(KOKORO_VOICES), "openai": list(OPENAI_VOICES),
                      "grok": list(GROK_VOICES), "elevenlabs": [k.capitalize() for k in ELEVEN_KNOWN],
+                     "piper": list(PIPER_VOICES),
                      "system": ["(system default)"], "custom": ["(depends on endpoint)"]}[target]
             print(f"{target} voices: {', '.join(names)}")
         elif action == "providers":

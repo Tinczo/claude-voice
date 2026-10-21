@@ -25,6 +25,9 @@ dependencies = [
 
 [project.optional-dependencies]
 local = ["kokoro>=0.7"]
+# Piper voices (many languages, including Polish). piper-tts is GPL-3.0, so
+# it is opt-in only and deliberately not part of "all".
+piper = ["piper-tts>=1.3"]
 all = ["kokoro>=0.7"]
 
 [project.urls]

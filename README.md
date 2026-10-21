@@ -96,7 +96,7 @@ Differences from macOS and Linux:
 - Runtime and config folders get an access-control list for your account instead of `chmod 600`. Administrators can still read them, just as root can on Unix.
 - Every console shares one routing key, so `/voice mute` silences all of them. Use `/voice session off` or `/voice project off` to silence a single session or project.
 - Hooks play audio only; karaoke renders only for `--no-daemon` runs in a console.
-- The `system` provider uses the built-in Windows voices (`claude-voice voices system`). Add more, including other languages, in Settings → Time & language → Speech.
+- The `system` provider uses the Windows SAPI voices (`claude-voice voices system`). Voices added in Settings → Time & language → Speech are OneCore voices, which SAPI does not see; use `piper` for other languages.
 - `claude-voice clip` reads the clipboard through PowerShell.
 
 ---
@@ -106,6 +106,7 @@ Differences from macOS and Linux:
 | Provider | What it is | Key | Karaoke sync |
 |---|---|---|---|
 | `kokoro` (default) | Local Kokoro 82M — free, private, runs on CPU | none | estimated |
+| `piper` | Local Piper — free, private, dozens of languages (e.g. Polish) | none | estimated |
 | `system` | Your OS voice (macOS `say` / espeak) — zero install | none | estimated |
 | `openai` | OpenAI TTS (`gpt-4o-mini-tts`) | `OPENAI_API_KEY` | estimated |
 | `elevenlabs` | ElevenLabs | `ELEVENLABS_API_KEY` | **true timestamps** |
@@ -121,6 +122,22 @@ For `custom`, set the endpoint in `~/.config/claude-voice/config.json`:
 ```
 
 Cloud providers that return MP3 need `ffmpeg` on PATH (`brew install ffmpeg`).
+
+### Piper (other languages, offline)
+
+Kokoro speaks English. For other languages, [Piper](https://github.com/OHF-Voice/piper1-gpl) runs locally with voices for dozens of languages:
+
+```bash
+.venv/bin/pip install -e ".[piper]"
+claude-voice provider piper
+claude-voice voice pl_PL-gosia-medium   # downloads the voice (~60 MB) once
+```
+
+Voice names come from [rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices); `claude-voice voices piper` lists a few. Models are stored in `~/.cache/claude-voice/piper`. The built-in developer pronunciations ("JSON" → "jason") only apply to English Piper voices.
+
+To try a voice in one Claude Code session without changing the others, use `/voice session provider piper` and `/voice session voice pl_PL-gosia-medium`.
+
+`piper-tts` is licensed GPL-3.0 (claude-voice is MIT), so it is an opt-in extra and not part of `[all]`.
 
 ---
 
