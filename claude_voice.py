@@ -2869,6 +2869,10 @@ def cmd_claim(args=None) -> None:
     cfg = load_config()
     if (data.get("prompt") or "").lstrip().startswith("/voice"):
         return  # /voice runs its own playback command; don't pause under it
+    if not cfg.get("enabled", True):
+        # Voice is off everywhere: nothing will speak, and every request resets
+        # the daemon's idle timer, so a ping would keep it (and its model) alive.
+        return
     enabled = cfg.get("enabled", True) and voice_rule(
         cfg, data.get("session_id"), data.get("cwd"))["enabled"]
     if not _daemon_alive():
