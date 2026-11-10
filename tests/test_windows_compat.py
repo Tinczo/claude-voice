@@ -190,6 +190,8 @@ class WindowsBranchTests(unittest.TestCase):
         allowed = next(line for line in text.splitlines() if line.startswith("allowed-tools:"))
         self.assertEqual(json.loads(allowed.split(":", 1)[1]), f"Bash({invoker} slash:*)")
         self.assertIn(f"!`{invoker} slash $ARGUMENTS`", text)
+        # $ARGUMENTS reaches a shell, so only the user may run /voice, never the model.
+        self.assertIn("\ndisable-model-invocation: true\n", text)
         self.assertEqual(hooks["Stop"][0]["hooks"][0]["command"], invoker)
         self.assertEqual(hooks["UserPromptSubmit"][0]["hooks"][0]["command"], f"{invoker} claim")
         context = hooks["UserPromptSubmit"][1]["hooks"][0]

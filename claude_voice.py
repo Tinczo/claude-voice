@@ -2483,6 +2483,7 @@ def _invoker() -> str:
 SLASH_TEMPLATE = """---
 description: "Control voice output: stop, pause, resume, session|project on|off|voice <name>|speed <x>|volume <x>, default on|off, on, off, mute, status, pronounce <term> <spoken>, provider <name>, voice <name>, speed <x>, volume <x>, theme <name>, style on|off, history on|off, voices"
 allowed-tools: {allowed_tools}
+disable-model-invocation: true
 ---
 
 ## Voice control result
