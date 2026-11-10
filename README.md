@@ -159,6 +159,8 @@ To try a voice in one Claude Code session without changing the others, use `/voi
 /voice voices              list voices for the current provider
 ```
 
+While a session speaks, a second `UserPromptSubmit` hook asks Claude to write replies for listening: plain prose instead of tables, headings and lists, and code only when you need the code itself. Sessions that don't speak (`/voice off`, a silenced session or project) get normal replies. `/voice style off` turns this off while keeping the voice. The hook runs synchronously, because Claude Code only reads context from hooks it waits for, so each prompt takes about half a second longer.
+
 The command runs instantly (it executes before the prompt is sent) and Claude just relays the result. The Stop hook does not speak that relay, so a pause command stays paused.
 
 ### Playback and session controls

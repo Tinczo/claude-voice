@@ -192,6 +192,10 @@ class WindowsBranchTests(unittest.TestCase):
         self.assertIn(f"!`{invoker} slash $ARGUMENTS`", text)
         self.assertEqual(hooks["Stop"][0]["hooks"][0]["command"], invoker)
         self.assertEqual(hooks["UserPromptSubmit"][0]["hooks"][0]["command"], f"{invoker} claim")
+        context = hooks["UserPromptSubmit"][1]["hooks"][0]
+        self.assertEqual(context["command"], f"{invoker} context")
+        # Claude Code ignores the output of async hooks, so this one must block.
+        self.assertNotIn("async", context)
 
     def test_system_voice_text_never_reaches_the_command_line(self):
         evil = "Done.'; Remove-Item -Recurse C:\\ ; $(calc) `whoami` \" #"

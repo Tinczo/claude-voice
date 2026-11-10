@@ -1,5 +1,7 @@
 """Prompt submit: pause the prompting terminal's speech and prewarm the daemon."""
 
+import io
+import json
 import unittest
 from unittest import mock
 
@@ -50,6 +52,48 @@ class ClaimHookTests(unittest.TestCase):
     def test_session_silenced_by_a_rule_still_pings_to_pause_others(self):
         sent, _ = self.run_claim({"prompt": "hi"}, enabled=False)
         self.assertEqual(len(sent), 1)
+
+
+class SpeechStyleContextTests(unittest.TestCase):
+    """The synchronous prompt hook asks for speakable replies only when they will be spoken."""
+
+    def run_context(self, payload, rule_enabled=True, **cfg):
+        out = io.StringIO()
+        with (
+            mock.patch.object(cv, "_read_hook_json", return_value=payload),
+            mock.patch.object(cv, "load_config", return_value=dict(cv.default_config(), **cfg)),
+            mock.patch.object(cv, "voice_rule", return_value={"enabled": rule_enabled}),
+            mock.patch("sys.stdout", out),
+        ):
+            cv.cmd_context()
+        return out.getvalue()
+
+    def test_speaking_session_gets_the_instruction_as_hook_context(self):
+        out = json.loads(self.run_context({"prompt": "explain this", "session_id": "s1"}))
+        self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit")
+        self.assertEqual(out["hookSpecificOutput"]["additionalContext"], cv.SPEECH_STYLE)
+
+    def test_replies_stay_normal_when_they_will_not_be_spoken(self):
+        cases = {
+            "voice off": ({"prompt": "hi"}, True, {"enabled": False}),
+            "session or project silenced": ({"prompt": "hi"}, False, {}),
+            "style off": ({"prompt": "hi"}, True, {"speech_style": False}),
+            "/voice command": ({"prompt": "/voice status"}, True, {}),
+        }
+        for name, (payload, rule_enabled, cfg) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.run_context(payload, rule_enabled, **cfg), "")
+
+    def test_style_can_be_switched_from_claude_code(self):
+        cfg = cv.default_config()
+        with (
+            mock.patch.object(cv, "load_config", return_value=cfg),
+            mock.patch.object(cv, "save_config") as save,
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            cv.cmd_slash(["style", "off"])
+        self.assertFalse(cfg["speech_style"])
+        save.assert_called_once()
 
 
 class PauseModeTests(unittest.TestCase):

@@ -490,6 +490,9 @@ def default_config() -> dict:
         # Pause speech when a prompt is submitted: "same" = only speech from
         # that prompt's terminal, "any" = any session, "off" = never.
         "pause_on_prompt": "same",
+        # Ask Claude to write replies for listening (no tables or lists) in
+        # sessions that speak. Injected by the UserPromptSubmit context hook.
+        "speech_style": True,
         # Extra term -> spoken form entries, merged over the built-in PRONOUNCE
         # table. Values may be plain respellings or Kokoro "[term](/IPA/)".
         "pronunciations": {},
@@ -2478,7 +2481,7 @@ def _invoker() -> str:
 
 
 SLASH_TEMPLATE = """---
-description: "Control voice output: stop, pause, resume, session|project on|off|voice <name>|speed <x>|volume <x>, default on|off, on, off, mute, status, pronounce <term> <spoken>, provider <name>, voice <name>, speed <x>, volume <x>, theme <name>, history on|off, voices"
+description: "Control voice output: stop, pause, resume, session|project on|off|voice <name>|speed <x>|volume <x>, default on|off, on, off, mute, status, pronounce <term> <spoken>, provider <name>, voice <name>, speed <x>, volume <x>, theme <name>, style on|off, history on|off, voices"
 allowed-tools: {allowed_tools}
 ---
 
@@ -2545,6 +2548,16 @@ def cmd_setup(args=None):
             "async": True,
         }],
     })
+    # Synchronous on purpose: Claude Code only reads context from hooks it
+    # waits for. Kept apart from `claim` so a slow daemon never delays prompts.
+    prompt_hooks.append({
+        "matcher": "",
+        "hooks": [{
+            "type": "command",
+            "command": f"{invoker} context",
+            "timeout": 10,
+        }],
+    })
     hooks["UserPromptSubmit"] = prompt_hooks
 
     settings["hooks"] = hooks
@@ -2558,7 +2571,8 @@ def cmd_setup(args=None):
 
     provider = cfg.get("provider", "kokoro")
     print(f"\n  {GREEN}✓{RESET} {BOLD}claude-voice v{VERSION} installed{RESET}")
-    print(f"    {LABEL}hooks{RESET}          Stop (speak) + UserPromptSubmit (claim terminal)")
+    print(f"    {LABEL}hooks{RESET}          Stop (speak) + UserPromptSubmit (claim terminal, "
+          "speakable replies)")
     print(f"    {LABEL}slash command{RESET}  {COMMAND_PATH}  {DIM}→ /voice in Claude Code{RESET}")
     print(f"    {LABEL}config{RESET}         {CONFIG_PATH}")
     print(f"    {LABEL}provider{RESET}       {provider} · {current_voice(cfg, provider)}")
@@ -2881,6 +2895,34 @@ def cmd_claim(args=None) -> None:
         return
     _send_to_daemon({"op": "claim", "tty_path": _resolve_tty(), "claim": enabled,
                      "pause": cfg.get("pause_on_prompt", "same")}, timeout=1.0)
+
+
+SPEECH_STYLE = (
+    "Voice output is on: claude-voice will read this reply aloud with text-to-speech. "
+    "Write it to be listened to. Use plain prose in short paragraphs. Do not use tables, "
+    "headings, or bullet or numbered lists unless the user asks for them; put the content "
+    "in sentences instead. Fenced code is not read aloud, so include code only when the "
+    "user needs the code itself, and say in a sentence what it does. Avoid URLs, long file "
+    "paths and symbols that are awkward to say. Keep the reply concise."
+)
+
+
+def cmd_context(args=None) -> None:
+    """UserPromptSubmit hook (synchronous): ask for speakable replies.
+
+    Prints nothing unless this session will speak, so with voice off, a
+    silenced session or project, or `speech_style` off, replies stay normal.
+    """
+    data = _read_hook_json()
+    cfg = load_config()
+    if not (cfg.get("enabled", True) and cfg.get("speech_style", True)):
+        return
+    if (data.get("prompt") or "").lstrip().startswith("/voice"):
+        return  # its reply only relays the command and is never spoken
+    if not voice_rule(cfg, data.get("session_id"), data.get("cwd"))["enabled"]:
+        return
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                             "additionalContext": SPEECH_STYLE}}))
 
 
 def cmd_unclaim(args=None) -> None:
@@ -3242,7 +3284,8 @@ def cmd_slash(args):
         return (f"voice is {state} · provider: {provider} · voice: "
                 f"{current_voice(cfg, provider) or 'default'} · speed: {cfg.get('speed', 1.0)}x "
                 f"· volume: {int(cfg.get('volume', 1.0) * 100)}% · theme: {cfg.get('theme', 'aurora')} "
-                f"· history: {'ON' if cfg.get('history_enabled', False) else 'OFF'}")
+                f"· history: {'ON' if cfg.get('history_enabled', False) else 'OFF'} "
+                f"· speakable replies: {'ON' if cfg.get('speech_style', True) else 'OFF'}")
 
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID")
     project_dir = _project_key(os.environ.get("CLAUDE_PROJECT_DIR"))
@@ -3332,6 +3375,11 @@ def cmd_slash(args):
             cfg["theme"] = rest[0].lower()
             save_config(cfg)
             print(f"theme set to {cfg['theme']}")
+        elif action == "style" and rest and rest[0].lower() in ("on", "off"):
+            cfg["speech_style"] = rest[0].lower() == "on"
+            save_config(cfg)
+            print("speakable replies (no tables or lists while voice is on) set to "
+                  f"{rest[0].lower()} — takes effect from the next prompt")
         elif action == "announce" and rest and rest[0].lower() in ("on", "off"):
             cfg["announce_project"] = rest[0].lower() == "on"
             save_config(cfg)
@@ -3380,7 +3428,7 @@ def cmd_slash(args):
             print("usage: /voice [on|off|toggle|mute|unmute|status|stop|pause|resume|pronounce <term> <spoken>|"
                   "session|project on|off|voice <v>|speed <x>|volume <x>|clear|default on|off|"
                   "provider <name>|voice <name>|"
-                  "speed <x>|volume <x>|theme <name>|announce on|off|history on|off|voices|providers]")
+                  "speed <x>|volume <x>|theme <name>|style on|off|announce on|off|history on|off|voices|providers]")
     except (ProviderError, ValueError) as e:
         print(f"error: {e}")
 
@@ -3396,6 +3444,7 @@ COMMANDS = {
     "mute": cmd_mute,
     "unmute": cmd_unmute,
     "claim": cmd_claim,
+    "context": cmd_context,
     "unclaim": cmd_unclaim,
     "clip": cmd_clip,
     "stop": cmd_stop,
